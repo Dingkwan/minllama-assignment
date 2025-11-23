@@ -6,6 +6,31 @@ This is an exercise in developing a minimalist version of Llama2, part of Carneg
 In this assignment, you will implement some important components of the Llama2 model to better understanding its architecture. 
 You will then perform sentence classification on ``sst`` dataset and ``cfimdb`` dataset with this model.
 
+## Environment
+
+This assignment was completed in the following environment:
+
+- Apple M2 chip
+- macOS 26.1
+
+## Statement
+
+The following error occurred:
+
+```
+UnpicklingError: Weights only load failed. This file can still be loaded, to do so you have two options, do those steps only if you trust the source of the checkpoint. 
+
+(1) In PyTorch 2.6, we changed the default value of the weights_only argument in torch.load from False to True. Re-running torch.load with weights_only set to False will likely succeed, but it can result in arbitrary code execution. Do it only if you got the file from a trusted source. 
+(2) Alternatively, to load with weights_only=True please check the recommended steps in the following error message.
+
+WeightsUnpickler error: Unsupported global: GLOBAL argparse.Namespace was not an allowed global by default. Please use torch.serialization.add_safe_globals([argparse.Namespace]) or the torch.serialization.safe_globals([argparse.Namespace]) context manager to allowlist this global if you trust this class/function. Check the documentation of torch.load to learn more about types accepted by default with weights_only https://pytorch.org/docs/stable/generated/torch.load.html.
+```
+I modified the `run_llama.py` file to disable the `weights_only` parameter.
+
+```
+saved = torch.load(args.filepath, ***weights_only=False***)    <- add weights_only=False
+```
+
 ## Assignment Details
 
 ### Your task
