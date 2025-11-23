@@ -15,7 +15,7 @@ This assignment was completed in the following environment:
 
 ## Statement
 
-The following error occurred:
+The following error occurred, due to PyTorch version differences:
 
 ```
 UnpicklingError: Weights only load failed. This file can still be loaded, to do so you have two options, do those steps only if you trust the source of the checkpoint. 
@@ -28,8 +28,49 @@ WeightsUnpickler error: Unsupported global: GLOBAL argparse.Namespace was not an
 I modified the `run_llama.py` file to disable the `weights_only` parameter.
 
 ```
-saved = torch.load(args.filepath, ***weights_only=False***)    <- add weights_only=False
+saved = torch.load(args.filepath, weights_only=False)    <- added weights_only=False
 ```
+
+## Results
+### Zero-Shot Prompting for SST
+
+```
+python run_llama.py --option prompt --batch_size 10  --train data/sst-train.txt --dev data/sst-dev.txt --test data/sst-test.txt --label-names data/sst-label-mapping.json --dev_out sst-dev-prompting-output.txt --test_out sst-test-prompting-output.txt
+```
+
+dev acc :: 0.156
+<br>
+test acc :: 0.148
+
+### Zero-Shot Prompting for CFIMDB
+
+```
+python run_llama.py --option prompt --batch_size 10  --train data/cfimdb-train.txt --dev data/cfimdb-dev.txt --test data/cfimdb-test.txt --label-names data/cfimdb-label-mapping.json --dev_out cfimdb-dev-prompting-output.txt --test_out cfimdb-test-prompting-output.txt
+```
+
+dev acc :: 0.490
+<br>
+test acc :: 0.379
+
+### Finetuning for SST
+
+```
+python run_llama.py --option finetune --epochs 5 --lr 2e-5 --batch_size 80  --train data/sst-train.txt --dev data/sst-dev.txt --test data/sst-test.txt --label-names data/sst-label-mapping.json --dev_out sst-dev-finetuning-output.txt --test_out sst-test-finetuning-output.txt
+```
+
+dev acc :: 0.418
+<br>
+test acc :: 0.450
+
+### Finetuning for CFIMDB
+
+```
+python run_llama.py --option finetune --epochs 5 --lr 2e-5 --batch_size 10  --train data/cfimdb-train.txt --dev data/cfimdb-dev.txt --test data/cfimdb-test.txt --label-names data/cfimdb-label-mapping.json --dev_out cfimdb-dev-finetuning-output.txt --test_out cfimdb-test-finetuning-output.txt
+```
+
+dev acc :: 0.898
+<br>
+test acc :: 0.502
 
 ## Assignment Details
 
