@@ -32,19 +32,19 @@ class RMSNorm(torch.nn.Module):
 
     def _norm(self, x):
         """
-        Compute the root mean square normalization. Use Equation 4 under
-        Section 4 of https://arxiv.org/abs/1910.07467 as a reference. Add 
-        the given epsilon value (self.eps) to the tensor's norm (i.e. inside
-        the square root in Equation 4) before normalizing the tensor.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The normalized tensor.
+        按 RMSNorm 论文公式做归一化：
+        - 对最后一维求均方值 mean(x^2)
+        - 加上 eps，防止除以 0
+        - 开平方得到 RMS，然后用 x / RMS 做归一化
         """
-        # todo
-        raise NotImplementedError
+        # 对最后一维求均方值，保持维度
+        rms_sq = x.pow(2).mean(dim=-1, keepdim=True)
+        # 加 eps 再开方，避免数值不稳定
+        denom = torch.sqrt(rms_sq + self.eps)
+        # 用 RMS 做归一化
+        return x / denom
+
+
 
     def forward(self, x):
         """
@@ -80,21 +80,45 @@ class Attention(nn.Module):
         self.dropout = config.dropout
 
     def compute_query_key_value_scores(self,
-                                       query: torch.Tensor,
-                                       key: torch.Tensor,
-                                       value: torch.Tensor) -> torch.Tensor:
+                                    query: torch.Tensor,
+                                    key: torch.Tensor,
+                                    value: torch.Tensor) -> torch.Tensor:
         '''
-        Jointly compute Scaled Dot Product Attention (see Section 3.2.1 in
-        https://arxiv.org/abs/1706.03762 for details). The query, key, and
-        value tensors each have shape (bs, n_local_heads, seqlen, head_dim).
-        An optimal implemention will jointly computing attention for multiple
-        heads (n_local_heads of them) at once using matrix/tensor operations.
+        实现多头缩放点积注意力（Scaled Dot-Product Attention）：
+        输入形状:
+            query, key, value: (batch_size, n_local_heads, seqlen, head_dim)
+        步骤:
+        1) Q @ K^T 并除以 sqrt(head_dim) 得到注意力分数
+        2) 加因果 mask，禁止看到未来位置
+        3) softmax 得到注意力权重
+        4) 对注意力权重做 dropout
+        5) 用注意力权重加权求和 V，得到输出
+        '''
+        batch_size, n_heads, seqlen, head_dim = query.size()
 
-        Make sure to use attention_dropout (self.attn_dropout) on the computed
-        attention matrix before applying it to the value tensor.
-        '''
-        # todo
-        raise NotImplementedError
+        # 1) 计算注意力分数: (b, h, t_q, t_k)
+        attn_scores = torch.matmul(query, key.transpose(-2, -1))
+        # 缩放
+        attn_scores = attn_scores / math.sqrt(head_dim)
+
+        # 2) 因果 mask：只允许注意当前以及之前的 token
+        causal_mask = torch.tril(
+            torch.ones((seqlen, seqlen), device=query.device, dtype=torch.bool)
+        )  # (seqlen, seqlen)
+        causal_mask = causal_mask.view(1, 1, seqlen, seqlen)  # 广播到 (b, h, t_q, t_k)
+        attn_scores = attn_scores.masked_fill(~causal_mask, float('-inf'))
+
+        # 3) softmax 得到注意力概率
+        attn_probs = F.softmax(attn_scores, dim=-1)
+
+        # 4) dropout
+        attn_probs = self.attn_dropout(attn_probs)
+
+        # 5) 加权求和 V，得到输出: (b, h, seqlen, head_dim)
+        output = torch.matmul(attn_probs, value)
+
+        return output
+
 
     def forward(
         self,
@@ -183,21 +207,31 @@ class LlamaLayer(nn.Module):
 
     def forward(self, x):
         '''
-        This is the forward pass of the basic transformer building block. This is a
-        modernized version of the block shown on the left of Figure 1 on
-        https://arxiv.org/pdf/1706.03762.pdf.
-
-        The transformer block should consist of:
-        1) layer normalization of the input (via Root Mean Square layer normalization)
-        2) self-attention on the layer-normalized input
-        3) a residual connection (i.e., add the input to the output of the self-attention)
-        3) layer normalization on the output of the self-attention
-        4) a feed-forward network on the layer-normalized output of the self-attention
-        5) add a residual connection from the unnormalized self-attention output to the
-           output of the feed-forward network
+        Transformer Block 前向流程（Pre-LN 版本）：
+        1) 对输入做 RMSNorm
+        2) 对归一化后的表示做自注意力
+        3) 残差连接：x + attn_output
+        4) 对残差结果做 RMSNorm
+        5) 送入前馈网络（FFN）
+        6) 再做一次残差连接：h + ffn_output
         '''
-        # todo
-        raise NotImplementedError
+        # 1) 归一化后送入注意力
+        attn_input = self.attention_norm(x)
+        # 2) 自注意力
+        attn_output = self.attention(attn_input)
+        # 3) 第一条残差连接
+        h = x + attn_output
+
+        # 4) 对 h 做归一化，送入 FFN
+        ffn_input = self.ffn_norm(h)
+        # 5) 前馈网络
+        ffn_output = self.feed_forward(ffn_input)
+        # 6) 第二条残差连接
+        out = h + ffn_output
+
+        return out
+
+
 
 class Llama(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
@@ -259,42 +293,46 @@ class Llama(LlamaPreTrainedModel):
     @torch.inference_mode()
     def generate(self, idx, max_new_tokens, temperature=1.0):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        We perform this generation using basic temperature sampling. Note that we are not using
-        nucleus sampling (i.e. limiting ourselves to sampling from the top-k most probable tokens
-        at each timestep), though this is often used in conjunction with temperature sampling,
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        Also note this is a super inefficient version of sampling with no key/value cache.
+        自回归文本生成：
+        - 输入 idx: (batch_size, cur_len) 的 token 序列
+        - 每一步：
+          1) 截断到 max_seq_len
+          2) 前向得到最后一个时间步的 logits
+          3) 根据 temperature 采样/选择下一个 token
+          4) 拼接到序列末尾
         """
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] # crop to just the final time step
-            # todo
-            raise NotImplementedError
+            # 1) 防止上下文长度超过最大长度
+            if idx.size(1) > self.params.max_seq_len:
+                idx_cond = idx[:, -self.params.max_seq_len:]
+            else:
+                idx_cond = idx
+
+            # 2) 前向计算，拿到 logits
+            logits, _ = self(idx_cond)       # (b, t, vocab_size)
+            logits = logits[:, -1, :]        # 只取最后一个时间步 (b, vocab_size)
 
             if temperature == 0.0:
-                # select the single most likely index
-                idx_next = None
+                # 温度为 0：贪心解码，取概率最大的 token
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (b, 1)
             else:
                 '''
-                Perform temperature sampling:
-                1) identify  the logits at the final step.
-                2) scale (divide) these probabilities by the given temperature.
-                3) normalize the scaled logits with a softmax to obtain scaled probabilities.
-                4) sample from the scaled probability distribution.
-
-                Note that we are not using top-k sampling/nucleus sampling in this procedure.
+                Temperature sampling 过程：
+                1) logits / temperature，温度越低分布越尖锐
+                2) softmax 得到概率分布
+                3) 从该分布中采样下一个 token
                 '''
-                idx_next = None
-            # append sampled index to the running sequence and continue
+                scaled_logits = logits / temperature
+                probs = F.softmax(scaled_logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)     # (b, 1)
+
+            # 3) 把新 token 拼到序列末尾
             idx = torch.cat((idx, idx_next), dim=1)
 
-
         return idx
+
+
+
 
 def load_pretrained(checkpoint):
   device = 'cuda' if torch.cuda.is_available() else 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.

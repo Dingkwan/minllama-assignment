@@ -6,22 +6,19 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     Helper function to reshape frequency tensor to have the same shape as the target tensor 'x'
     for the purpose of broadcasting the frequency tensor during element-wise operations.
 
-    Args:
-        freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
-        x (torch.Tensor): Target tensor for broadcasting compatibility.
-
-    Returns:
-        torch.Tensor: Reshaped frequency tensor.
-
-    Raises:
-        AssertionError: If the frequency tensor doesn't match the expected shape.
-        AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
+    freqs_cis: (seqlen, head_dim // 2)
+    x:         (..., seqlen, ..., head_dim // 2)  —— 实际用在复数表示的 q/k 上
     """
     ndim = x.ndim
+    # 我们假设时间维在 dim=1，最后一维是要旋转的维度
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(shape)
+    # 生成形状形如 (1, seqlen, 1, ..., head_dim//2)
+    shape = [1] * ndim
+    shape[1] = x.shape[1]
+    shape[-1] = x.shape[-1]
+    return freqs_cis.view(*shape)
+
 
 def apply_rotary_emb(
     query: torch.Tensor,
@@ -33,43 +30,51 @@ def apply_rotary_emb(
     """
     Apply rotary embeddings to input tensors using the given frequency tensor.
 
-    This function applies rotary embeddings to the given query and key tensors. The rotation to each token
-    embedding is a function of that token's position in the sequence, head_dim, and theta.
-    The input tensors are reshaped as complex numbers to simplify your implementation.
-
-    Args:
-        query (torch.Tensor): Query tensor to apply rotary embeddings.
-                              Shape: (batch_size, seqlen, n_local_heads, self.head_dim)
-        key (torch.Tensor): Key tensor to apply rotary embeddings.
-                              Shape: (batch_size, seqlen, n_local_kv_heads, self.head_dim)
-        head_dim (int): Dimension of each attention head.
-        max_seq_len (int): Maximum sequence length supported by model.
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
+    query: (batch_size, seqlen, n_local_heads, head_dim)
+    key:   (batch_size, seqlen, n_local_kv_heads, head_dim)
     """
-
-    _, seqlen, _, _ = query.shape
+    bsz, seqlen, _, _ = query.shape
     device = query.device
-    # todo
-    #
-    # Please refer to slide 22 in https://phontron.com/class/anlp2024/assets/slides/anlp-05-transformers.pdf
-    # and Section 3 in https://arxiv.org/abs/2104.09864.
+    dtype = query.dtype
 
-    # reshape xq and xk to match the complex representation
-    query_real, query_imag = query.float().reshape(query.shape[:-1] + (-1, 2)).unbind(-1)
-    key_real, key_imag = key.float().reshape(key.shape[:-1] + (-1, 2)).unbind(-1)
-    # This separates each query/key vector into its odd and even indices (assuming *one-indexing*).
-    # query_real contains q_1, q_3, q_5, ... and query_imag contains q_2, q_4, q_6, ...
+    assert head_dim % 2 == 0, "RoPE 需要 head_dim 为偶数"
+    half_dim = head_dim // 2
 
-    # First, compute the trigonometric values in the second and fourth columns in
-    # slide 22 (linked above).
+    # 1) 构造每个维度的频率：inv_freq[i] = theta^{-2i / head_dim}
+    dim_idx = torch.arange(half_dim, device=device, dtype=torch.float32)  # (half_dim,)
+    inv_freq = 1.0 / (theta ** (2 * dim_idx / head_dim))                  # (half_dim,)
 
-    # Then, combine these trigonometric values with the tensors query_real, query_imag,
-    # key_real, and key_imag.
+    # 2) 位置：0,1,...,max_seq_len-1，然后只取前 seqlen 个
+    positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)  # (max_seq_len,)
+    angles = torch.einsum("p,d->pd", positions, inv_freq)                      # (max_seq_len, half_dim)
 
-    raise NotImplementedError
+    # 只用实际序列长度部分
+    angles = angles[:seqlen]                                                  # (seqlen, half_dim)
 
-    query_out = None
-    key_out = None
-    # Return the rotary position embeddings for the query and key tensors
-    return query_out, key_out
+    # 3) 用极坐标形式生成复数：cos(θ) + i·sin(θ)
+    freqs_cis = torch.polar(torch.ones_like(angles), angles)                  # (seqlen, half_dim), complex64
+
+    # 4) 把 q/k 视作复数：最后一维拆成 (half_dim, 2)
+    #    view_as_complex 要求最后一维 size=2，因此 reshape(..., half_dim, 2)
+    q_float = query.float().reshape(*query.shape[:-1], -1, 2)                 # (..., half_dim, 2)
+    k_float = key.float().reshape(*key.shape[:-1], -1, 2)
+
+    q_complex = torch.view_as_complex(q_float)                                # (b, seqlen, n_heads, half_dim), complex
+    k_complex = torch.view_as_complex(k_float)
+
+    # 5) 利用 reshape_for_broadcast 把 freqs_cis broadcast 到 q/k 的形状
+    freqs_cis_broadcast = reshape_for_broadcast(freqs_cis, q_complex)         # (1, seqlen, 1, half_dim)
+
+    # 6) 复数乘法实现旋转
+    q_rot = q_complex * freqs_cis_broadcast
+    k_rot = k_complex * freqs_cis_broadcast
+
+    # 7) 把复数再还原回实数张量，形状恢复成原始的 (b, seqlen, n_heads, head_dim)
+    q_out = torch.view_as_real(q_rot).reshape(bsz, seqlen, -1, head_dim)      # (..., 2) -> head_dim
+    k_out = torch.view_as_real(k_rot).reshape(bsz, seqlen, -1, head_dim)
+
+    # 8) 转回原来的 dtype（可能是 float16/bfloat16）
+    q_out = q_out.to(dtype=dtype)
+    k_out = k_out.to(dtype=dtype)
+
+    return q_out, k_out

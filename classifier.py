@@ -46,13 +46,35 @@ class LlamaEmbeddingClassifier(torch.nn.Module):
 		self.classifier_head = torch.nn.Linear(self.llama.config.dim, self.num_labels)
 
 	def forward(self, input_ids):
-		'''
-		1) Find the hidden state after the final token of the input sequence
-		2) Apply dropout (self.dropout) to the hidden state at training time to mitigate
-		   overfitting.
-		2) Pass this through the classifier head (self.classifier_head), which will return
-		   logits (unnormalized probabilities) over all classes.
-		3) Take the log-softmax of the logits and return log-probabilities over all classes.
-		'''
-		# todo
-		raise NotImplementedError
+			'''
+			1) Find the hidden state after the final token of the input sequence
+			2) Apply dropout (self.dropout) to the hidden state at training time to mitigate
+			overfitting.
+			3) Pass this through the classifier head (self.classifier_head), which will return
+			logits (unnormalized probabilities) over all classes.
+			4) Take the log-softmax of the logits and return log-probabilities over all classes.
+			'''
+			# 调用 Llama，拿到所有时间步的 hidden states
+			_, hidden_states = self.llama(input_ids)  # hidden_states: (batch_size, seq_len, hidden_dim)
+
+			# 我们的输入是右侧 padding 的 0，需要取「最后一个非 0 token」的位置
+			# mask: True 表示非 padding
+			mask = (input_ids != 0)  # (batch_size, seq_len)
+			# 每个样本有效 token 数量
+			lengths = mask.sum(dim=1)  # (batch_size,)
+			# 最后一个非 padding token 的下标 = 有效长度 - 1
+			last_indices = (lengths - 1).clamp(min=0)  # 防止极端情况下出现负数
+
+			batch_size = input_ids.size(0)
+			# 取出对应时间步的 hidden state: (batch_size, hidden_dim)
+			last_hidden = hidden_states[torch.arange(batch_size, device=input_ids.device), last_indices, :]
+
+			# Dropout
+			last_hidden = self.dropout(last_hidden)
+
+			# 分类头得到 logits: (batch_size, num_labels)
+			logits = self.classifier_head(last_hidden)
+
+			# 返回 log-probabilities
+			log_probs = F.log_softmax(logits, dim=-1)
+			return log_probs
